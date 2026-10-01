@@ -1,0 +1,1556 @@
+<!doctype html>
+<html lang="en"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          }
+        };
+
+        window.addEventListener('click', (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (!handledByArtifact && fragment !== "") scrollToFragment(fragment);
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const [header, base64Data] = href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hands-on training tracker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&amp;family=Instrument+Sans:wght@400;500;600&amp;display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#EEF2F7; --surface:#FFFFFF; --ink:#12213A; --mute:#5B6B84; --line:#D6DEEA; --late:#C2261B; --on:#FFFFFF;
+  --c0:#00968F; --c1:#6A4CFF; --c2:#E8481F; --c3:#C98A00; --c4:#2F7BFF; --c5:#C2338A; --c6:#3C8A2E; --c7:#8A5A33;
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0D1524; --surface:#16213A; --ink:#E7EDF8; --mute:#9AA9C2; --line:#27385A; --late:#FF7A6E; --on:#0D1524;
+    --c0:#2CCBC2; --c1:#9C86FF; --c2:#FF7A52; --c3:#F0B429; --c4:#6BA3FF; --c5:#F070B8; --c6:#6FCB5F; --c7:#D09A6A;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0D1524; --surface:#16213A; --ink:#E7EDF8; --mute:#9AA9C2; --line:#27385A; --late:#FF7A6E; --on:#0D1524;
+  --c0:#2CCBC2; --c1:#9C86FF; --c2:#FF7A52; --c3:#F0B429; --c4:#6BA3FF; --c5:#F070B8; --c6:#6FCB5F; --c7:#D09A6A;
+}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*,*::before,*::after{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:400 15px/1.5 "Instrument Sans",system-ui,-apple-system,"Segoe UI",sans-serif}
+button,input{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:3px solid var(--c4);outline-offset:2px;border-radius:6px}
+.wrap{max-width:1180px;margin:0 auto;padding:28px 20px 90px}
+h1,h2,h3{font-family:"Bricolage Grotesque","Instrument Sans",system-ui,sans-serif;margin:0;letter-spacing:-.02em}
+
+.head h1{font-size:clamp(34px,6vw,60px);line-height:1;font-weight:800}
+.head p{margin:10px 0 0;color:var(--mute);max-width:60ch}
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin:22px 0}
+.spacer{flex:1}
+.start{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--mute)}
+.start input{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:8px 10px}
+.btn{border:1px solid var(--line);background:var(--surface);border-radius:10px;padding:9px 15px;font-weight:500}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.primary{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.summary{display:flex;flex-wrap:wrap;gap:6px 26px;margin:0 0 18px}
+.summary b{font-family:"Bricolage Grotesque",sans-serif;font-size:20px;font-weight:700;margin-right:4px}
+.summary .late b{color:var(--late)}
+
+/* route */
+.route{background:var(--surface);border:1px solid var(--line);border-radius:20px;padding:22px 22px 46px}
+.gantt{--lw:190px;position:relative}
+.axis{display:grid;grid-template-columns:var(--lw) 1fr;margin-bottom:8px}
+.axis-lane{position:relative;height:18px}
+.axis-lane span{position:absolute;top:0;font-size:12px;color:var(--mute);padding-left:5px;white-space:nowrap}
+.grows{position:relative}
+.lines{position:absolute;left:var(--lw);right:0;top:0;bottom:0;pointer-events:none}
+.lines i{position:absolute;top:0;bottom:0;border-left:1px solid var(--line)}
+.lines .today{position:absolute;top:-6px;bottom:-6px;border-left:2px solid var(--ink)}
+.lines .today span{position:absolute;bottom:-26px;left:0;transform:translateX(-50%);background:var(--ink);color:var(--bg);font-size:12px;font-weight:600;padding:1px 10px;border-radius:99px;white-space:nowrap}
+.grow{position:relative;display:grid;grid-template-columns:var(--lw) 1fr;align-items:center;width:100%;text-align:left;background:none;border:0;border-top:1px solid var(--line);border-radius:0;padding:12px 0}
+.grow:focus-visible{border-radius:8px}
+.gtxt{padding-right:16px;min-width:0}
+.gl{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+.gn{font-family:"Bricolage Grotesque",sans-serif;font-weight:700;font-size:18px;line-height:1.2;overflow-wrap:anywhere}
+.grow[aria-pressed="true"] .gn{text-decoration:underline;text-decoration-color:var(--c);text-decoration-thickness:3px;text-underline-offset:4px}
+.gp{font-weight:600;color:var(--c);flex:none}
+.gm{display:block;font-size:12px;color:var(--mute);line-height:1.35;margin-top:2px}
+.gm .late{color:var(--late);font-weight:600}
+.lane{position:relative;height:32px}
+.lbar{position:absolute;top:0;bottom:0;left:var(--l);width:var(--w);border-radius:10px;background:color-mix(in srgb,var(--c) 22%,var(--surface));overflow:hidden}
+.lbar i{position:absolute;left:0;top:0;bottom:0;width:var(--p);background:var(--c);transition:width .35s}
+.cap{margin:20px 0 0;font-size:13px;color:var(--mute)}
+.empty{color:var(--mute);padding:10px 0}
+
+/* matrix */
+.sec-title{font-size:24px;font-weight:700;margin:34px 0 12px}
+.scroll{overflow-x:auto}
+.matrix{width:100%;border-collapse:separate;border-spacing:0 6px}
+.matrix th{font-weight:500;font-size:13px;color:var(--mute);text-align:left;padding:0 8px 2px;white-space:nowrap}
+.matrix th .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--c);margin-right:6px}
+.matrix td{padding:0 4px}
+.matrix td:first-child{padding-left:0}
+.matrix .who{font-family:"Bricolage Grotesque",sans-serif;font-weight:700;font-size:18px;white-space:nowrap;padding-right:14px}
+.cell{width:100%;min-width:74px;border:1px solid var(--line);background:var(--surface);border-radius:12px;padding:8px 10px;text-align:left;position:relative;overflow:hidden}
+.cell b{position:relative;font-size:16px}
+.cell::before{content:"";position:absolute;left:0;bottom:0;height:5px;width:var(--w);background:var(--c,var(--ink));transition:width .35s}
+.cell.all{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.cell.all::before{background:var(--bg)}
+
+/* labs */
+.tabs{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+.tab{border:1px solid var(--line);background:var(--surface);border-radius:99px;padding:6px 14px;font-size:14px;font-weight:500}
+.tab[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.key{font-size:13px;color:var(--mute);margin:0 0 12px;max-width:80ch}
+.panel{background:var(--surface);border:1px dashed var(--mute);border-radius:16px;padding:14px 16px;margin-bottom:16px}
+.panel .people{display:flex;flex-wrap:wrap;gap:10px;margin:8px 0}
+.panel .person{display:flex;gap:6px;align-items:center}
+.panel .person .in{width:150px}
+.lab{background:var(--surface);border:1px solid var(--line);border-left:8px solid var(--c);border-radius:18px;padding:18px 20px 12px;margin-bottom:16px}
+.lab-head{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;justify-content:space-between;margin-bottom:10px}
+.lab-head h3{font-size:24px;font-weight:700}
+.lab-head .meta{color:var(--mute);font-size:14px}
+.lh-tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.stepper{display:inline-flex;align-items:center;gap:6px;font-size:14px;color:var(--mute)}
+.stepper button{width:30px;height:30px;border-radius:8px;border:1px solid var(--line);background:var(--bg);font-weight:700;line-height:1}
+.stepper .in{width:58px;text-align:center}
+.in{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 8px;color:var(--ink)}
+.in.sm{font-size:13px;margin-top:4px}
+.in.big{font-family:"Bricolage Grotesque",sans-serif;font-size:22px;font-weight:700}
+.mini{border:1px solid var(--line);background:var(--bg);border-radius:8px;padding:5px 9px;font-size:13px;color:var(--mute)}
+.mini.danger{color:var(--late)}
+.hbtn{background:none;border:0;padding:2px 0;font-size:13px;color:var(--mute);text-decoration:underline dotted;text-underline-offset:3px}
+.row{display:grid;grid-template-columns:minmax(0,1fr) 156px repeat(var(--np),112px) 96px;gap:8px;align-items:center;padding:9px 0;border-top:1px solid var(--line)}
+.row.hd{border-top:0;font-size:13px;color:var(--mute);padding:4px 0}
+.row.hd .hbtn{text-align:center}
+.item b{font-weight:600;overflow-wrap:anywhere}
+.item small{display:block;color:var(--mute);font-size:13px;line-height:1.35}
+.due{font-size:14px;color:var(--mute)}
+.due.late{color:var(--late);font-weight:600}
+.tools{display:flex;gap:5px;flex-wrap:wrap}
+.pill{width:100%;border-radius:10px;border:1px dashed var(--mute);background:transparent;padding:7px 8px;font-size:13px;font-weight:500;text-align:center;color:var(--mute);transition:background .2s}
+.pill .pn{display:none;font-size:11px;opacity:.8}
+.pill.s1{border:1px solid color-mix(in srgb,var(--c) 40%,var(--surface));background:color-mix(in srgb,var(--c) 14%,var(--surface));color:var(--ink)}
+.pill.s2{border:1px solid color-mix(in srgb,var(--c) 70%,var(--surface));background:color-mix(in srgb,var(--c) 38%,var(--surface));color:var(--ink)}
+.pill.s3{border:1px solid var(--c);background:var(--c);color:var(--on);font-weight:600}
+.addrow{padding-top:10px;border-top:1px solid var(--line)}
+.plan{display:flex;flex-wrap:wrap;gap:8px;align-items:center;background:color-mix(in srgb,var(--c) 8%,var(--surface));border:1px solid color-mix(in srgb,var(--c) 30%,var(--line));border-radius:14px;padding:10px 12px;margin:4px 0 12px}
+.ck{display:flex;gap:10px;align-items:flex-start;cursor:pointer}
+.ck input,.ckrow>input{width:17px;height:17px;margin:3px 0 0;accent-color:var(--c);flex:none}
+.ckrow{display:flex;gap:10px;align-items:flex-start}
+.ckrow .fields{flex:1;min-width:0}
+.row.hd .ck{font-size:13px;color:var(--mute);align-items:center}
+.row.hd .ck input{margin:0}
+.dbtn{background:none;border:0;padding:2px 0;color:inherit;font:inherit;text-align:left;text-decoration:underline dotted;text-underline-offset:3px}
+.cal{position:fixed;z-index:55;width:304px;background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:12px;box-shadow:0 10px 30px rgba(10,20,40,.25)}
+.cal[hidden]{display:none}
+.cal .ch{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.cal .ch b{font-family:"Bricolage Grotesque",sans-serif;font-size:16px}
+.cal .ch button,.cal .cf button{border:1px solid var(--line);background:var(--bg);border-radius:8px;padding:4px 10px;font-size:13px}
+.cal .cw,.cal .cg{display:grid;grid-template-columns:repeat(7,1fr);gap:2px}
+.cal .cw span{font-size:11px;color:var(--mute);text-align:center;padding-bottom:4px}
+.cal .cg button{aspect-ratio:1;border:0;background:none;border-radius:8px;font-size:13px;padding:0}
+.cal .cg button.we{color:var(--mute)}
+.cal .cg button.win{background:color-mix(in srgb,var(--c) 12%,var(--surface))}
+.cal .cg button.rg{background:color-mix(in srgb,var(--c) 34%,var(--surface))}
+.cal .cg button.ed{background:var(--c);color:var(--on);font-weight:600}
+.cal .cg button.td{box-shadow:inset 0 0 0 2px var(--ink)}
+.cal .cg button:hover{outline:2px solid var(--c);outline-offset:-2px}
+.cal .cf{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;margin-top:10px;font-size:13px;color:var(--mute)}
+.cal .cf .acts{display:flex;gap:6px}
+.foot{margin-top:26px;font-size:13px;color:var(--mute)}
+
+/* picker + toast */
+.menu{position:fixed;z-index:50;min-width:200px;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:6px;box-shadow:0 10px 30px rgba(10,20,40,.25)}
+.menu[hidden],.toast[hidden]{display:none}
+.menu .mt{font-size:12px;color:var(--mute);padding:4px 10px 6px}
+.menu button{display:flex;align-items:center;gap:10px;width:100%;border:0;background:none;padding:10px;border-radius:9px;text-align:left}
+.menu button:hover,.menu button[aria-checked="true"]{background:color-mix(in srgb,var(--c,var(--ink)) 14%,var(--surface))}
+.menu button[aria-checked="true"]{font-weight:600}
+.sd{width:16px;height:16px;border-radius:50%;border:2px solid var(--c,var(--ink));display:inline-block;flex:none}
+.sd.s0{border-style:dashed;border-color:var(--mute)}
+.sd.s1{background:color-mix(in srgb,var(--c,var(--ink)) 25%,var(--surface))}
+.sd.s2{background:color-mix(in srgb,var(--c,var(--ink)) 60%,var(--surface))}
+.sd.s3{background:var(--c,var(--ink))}
+.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(20px + env(safe-area-inset-bottom,0px));background:var(--ink);color:var(--bg);padding:8px 10px 8px 16px;border-radius:14px;display:flex;gap:14px;align-items:center;z-index:60;max-width:92vw}
+.toast .btn{background:transparent;color:var(--bg);border-color:color-mix(in srgb,var(--bg) 55%,transparent);padding:5px 12px}
+
+@media (max-width:820px){
+  .route{padding-bottom:22px}
+  .gantt{--lw:0px}
+  .axis,.lines{display:none}
+  .grow{grid-template-columns:1fr;gap:10px}
+  .lbar{left:0;width:100%}
+  .row{grid-template-columns:repeat(auto-fit,minmax(92px,1fr))}
+  .row.hd{display:none}
+  .item,.due,.tools{grid-column:1/-1}
+  .due{margin-top:-6px}
+  .pill .pn{display:block}
+}
+@media (max-width:560px){
+  .matrix .who{font-size:15px;padding-right:6px}
+  .cell{min-width:0;padding:6px}
+  .cell b{font-size:13px}
+}
+.filenote{margin:-10px 0 18px;font-size:13px;color:var(--mute)}
+#savebar{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(18px + env(safe-area-inset-bottom,0px));z-index:58;display:flex;gap:14px;align-items:center;background:var(--surface);border:2px solid var(--ink);border-radius:16px;padding:8px 10px 8px 18px;font-weight:500;box-shadow:0 10px 30px rgba(10,20,40,.25)}
+#savebar[hidden]{display:none}
+body.dirty .toast{bottom:calc(88px + env(safe-area-inset-bottom,0px))}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<style>
+.brandwrap{max-width:1180px;margin:0 auto;padding:18px 20px 0}
+.brandbar{display:flex;justify-content:space-between;align-items:center;gap:16px;background:#fff;border:1px solid #D6DEEA;border-radius:18px;padding:12px 24px}
+.brandbar img{height:56px;width:auto;display:block}
+@media (max-width:560px){.brandbar{padding:10px 14px}.brandbar img{height:36px}}
+</style>
+<header class="brandwrap">
+  <div class="brandbar" style="display: flex; justify-content: space-between; align-items: center;">
+    <div style="flex: 1; display: flex; justify-content: flex-start;">
+      <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAUsAAAB4CAMAAABM8CAbAAABgFBMVEX///////7+//7//v/+/v/+/v7+/v3+/f79/v39/f79/f38/f38/fv9/P38/P38/Pz8/Pv8+/37/Pr7+/z7+/v7+/r5+/j6+vn4+Pj09vPy8vPv7+7u7u/s7O3q7Ojn5+je6tfj4+Xd3d3X19nM09S915PKyczHx8fKxdfDxMi1xJWjyFKaxnWXxE6RwkyYw0qPwUqOwUqTwke9vMG4tr2ZuH50ubBxt654s7KGvDysrK2op6+boKOTkpeIh41nrKlPj5xNjZpMjZpLjZpKi5lCh5SAfoh6en10c3pubm9qaXFkZGVfXmVWVF5OTlBOSGpHR0hPRH1OQ3xNQ3xDREtKPntBPU07OkA4NFEyMTIuLGosK2ksKmksKmgrKmgtKy0rKFgiIGEnJygiIiMdHh8XGCAQEBEJCgsHCAkHBwgGBwkGBwgGBwcGBgcFBwgFBggFBgcFBgYEBgcFBQYEBQcEBQYEBQUEBAUDBAUDBAQCBAUCAgMBAQEBAAAAAAEAAABZ1KdUAAAih0lEQVR42u2di3caR9Loy4rbkcaJ+LJmzYCEEA+DoZYVK3AcGQYk2xIPITiQhMMZ+bM44jGQsPmW3Vw28sL1/Ou3ep49DxB65Lu591OfRJaGmZ6e31RXVVdXNwD35a7Lg0e0rNrDuLiDuLtzyj/P2Ugn+Z1i2NyjOe5q3E0fYfkPLy2fbT+lf9+XmZQW2dmnZe/Nm59k9zVuW1Z293VevXlGcL7YfwX0/vwVKenPaGslRp7mzfi+ZtOvn2K6Psvnn17C9/HpjkT0mMLGjWo509E+arNztb8OjB3beA87gXbt7ZHG0y4bg5ZwBx1MQtfVO1kOu3TG0WIZz7x4+MTq6J5u42PPi/qjWJ1k4u5NH+Xlvyynmv5q7apdD3BfV3wDkV5jbL8hVqzWd3b4K8sYRrScZ9jhbjj2i2VG93ep12vSzEKCTi6P7hlK2qaFjByT5gLJmYX5JhRYl443M+jtqFHP+P52pip9cWa8VM1H4z1cNkUSqiid7Ro7tVfBsdeXzpLGO5FwJLg5BkUKhLslkGrVxIOc4WHxTlAVvTp4nUE0+zljOJ6HpTtYzkIp5KYLPnetJIrtobRrKtS7NZUisXsb/kFdh4uWeHueO/U5hLs0ShDOS7sjwbjkZjWkaj4VSWe8VN4IiN5WxgrWtGn7BXYupbzHK2mOXMypKDWF2WL4dGs/B2UiVmN+R+O8s7h0lZzkYTZxnNLCzRRKY7sjwcTZinmox/keVuFlY4O0tbZfQRZbkvGBUS0fWmahkaLF1PGlpZeiAjySO2XZPRLzN5UA6z3sYjHPnYWd41zCXlEn8pTuVfnCeOh7Jc9rHP5ujj+hPimQVYv+s+7gVhNhs5bjb6p5xntc/qA6tvYWDexr9buT5LPKsq/zZyffLxr3J9i3m4eSzxzLEsaM93ZyzXIfXzp7+7vLlP/bBFRVl9IgbmU3JDa/5gdeUGcoknteTh3Gcfyq0t8+2yLMdUt5on/q9PUkyt865YEg6bP5pbBxvceOVa0JrfzGlfobrhK/9cliOmDKZdnSXx8DUW5UQ5YWKByRtmk2WpmNXL0dg8sUY0ltOBdiOznrFxawdLa8tMlh682dC4XLU9tMLxtB8ijFiurLqKpQ7zRiSfbj/bQY9/1ZXlVLYUSe8kHigxKMejmfr5aMTArBhSJLKcTDv1utjFanUkk8thVKmUtM37GLWYh0o2lraW1ZgO05uO9Y6klc/47mxi+Qi256DEsrd9bZh4vv/Zizdv9t6w1zIsp4NKmSknxQ2143ogPfvbxDDd1H+rndZafUSkH/3XSM7qbTdZjuQcAB+MoitlyBeaHy+9bf5Ev097ptYymdX0Q5UMwjJZTqaSpWUVQdcotGn/pTVM7hYSsVgyV0MPeDDtBZnB+YMHT3f2Xs1l+XLregMgjeTerk2mTZYTue93tfSokmaGYE1lUYgox8PZljz7py6sZuNZlnmijJ2CLR3mcFaz+/ZlTd+N5bRNk+ssx3KXnzMyxavVHjP+3AppByN5FPrc0mJJ7c9frjNx8QgebVOSyoUrD+awDD/xGsXj9ejtzRs9fDL9NY+PtYKf00BCbmBAHmK/5JwswUkI54OxNJ1owETVCcHqldv4nlQMlpknPu3WnJ1lSPvI/Fhz1erq1ag84uDjOBoNAQSUWhtswGgFniiriqroqJ1k4u5NLvKsi1nluV9cK7KcqVn5pS5bWfBsn1o1k3bNkaLkyC6615bJ6K1q84i+mQ8/cE25Yp1u21Mku3tWc2hY54a+m3u3mK66y0rN1hEslh17W2zL5uO6+xVw+vOVZ1c/3554/u+f0e137XjG6521xUvKx1Y6O8O/797N61W429f9eZ2169o+3P/y3N0n60V3Tffvff46uP4G3n951t3/0bHq719/8CgG4v8b1a5eJ511u1c5y83a3j82q422p1c//1969qXwO5W3u8z1e5b1+vWfWtfq8o+611r4T37v+n9e1fF0n3r1s/f+53K34vL//v//v988w===ERL=" width="331" height="120" alt="Regent">
+  </div>
+</style>
+<div class="wrap">
+  <div class="head">
+    <h1 id="prog-title">Hands-on training tracker</h1>
+    <p id="prog-desc">Monitor progress across all engineering and robotics labs. Click any roadmap step or lab cell to update its completion status.</p>
+  </div>
+
+  <div class="bar">
+    <div class="start">
+      <label for="start-date-in">Project Start Date</label>
+      <input type="date" id="start-date-in" value="2026-09-28">
+    </div>
+    <div class="spacer"></div>
+    <button class="btn" id="btn-theme" type="button">Dark Mode</button>
+    <button class="btn primary" id="btn-screenshot" type="button">Save Screenshot</button>
+  </div>
+
+  <div class="summary" id="summary-bar">
+    <div><b>4</b>Labs Tracked</div>
+    <div><b>12</b>Total Items</div>
+    <div><b>3</b>Completed</div>
+    <div class="late"><b>1</b>Overdue</div>
+  </div>
+
+  <!-- ROADMAP ROUTE -->
+  <section class="route" aria-labelledby="route-title">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h2 id="route-title" style="font-size:24px;font-weight:700">Training Roadmap</h2>
+      <button class="hbtn" id="btn-expand-all" type="button">Expand all labs</button>
+    </div>
+    <div class="gantt" id="gantt-chart">
+      <!-- injected via js -->
+    </div>
+  </section>
+
+  <!-- MATRIX -->
+  <section aria-labelledby="matrix-title">
+    <h2 id="matrix-title" class="sec-title">Team Progress Matrix</h2>
+    <p class="filenote">Click any cell to update an engineer's completion level for that lab.</p>
+    <div class="scroll">
+      <table class="matrix" id="matrix-table" aria-label="Team progress matrix">
+        <!-- injected via js -->
+      </table>
+    </div>
+  </section>
+
+  <!-- LAB DETAILS -->
+  <section aria-labelledby="labs-title" style="margin-top:42px">
+    <h2 id="labs-title" class="sec-title">Lab Details &amp; Checklists</h2>
+    <div class="tabs" id="lab-tabs" role="tablist">
+      <!-- injected via js -->
+    </div>
+    <p class="key" id="lab-key">Click status buttons to cycle through: Not Started (dash), In Progress (1/3 or 2/3), Completed (full).</p>
+    
+    <div class="panel" id="team-panel">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+        <strong style="font-size:14px">Assignees for this lab:</strong>
+        <button class="mini" id="btn-manage-team" type="button">Edit Team Members</button>
+      </div>
+      <div class="people" id="lab-people-chips"></div>
+    </div>
+
+    <div id="labs-container">
+      <!-- injected via js -->
+    </div>
+  </section>
+
+  <div class="foot">
+    Hands-on training tracker · Fortes Education &amp; Regent
+  </div>
+</div>
+
+<!-- SIGN-OFF APPROVAL BOX -->
+<section class="wrap" style="padding-top: 0px; padding-bottom: 20px;">
+  <div style="background: var(--surface); border: 1px solid var(--line); border-radius: 18px; padding: 20px 24px; display: flex; flex-wrap: wrap; gap: 20px; align-items: center; justify-content: space-between;">
+    <div>
+      <h3 style="font-size: 18px; font-weight: 700; margin-bottom: 4px;">Training Sign-off &amp; Approval</h3>
+      <p style="font-size: 13px; color: var(--mute); margin: 0;">This hands-on training tracker requires formal review and sign-off upon completion.</p>
+    </div>
+    <div style="display: flex; gap: 24px; align-items: center; flex-wrap: wrap;">
+      <div>
+        <div style="font-size: 12px; color: var(--mute); font-weight: 500;">APPROVER / TRAINER</div>
+        <div style="font-family: 'Bricolage Grotesque', sans-serif; font-size: 18px; font-weight: 700; color: var(--ink);">Dr. Sreejith</div>
+      </div>
+      <div style="border-left: 1px solid var(--line); padding-left: 20px; display: flex; flex-direction: column; gap: 4px;">
+        <div style="font-size: 12px; color: var(--mute); font-weight: 500;">STATUS</div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span style="display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--c6);"></span>
+          <span style="font-weight: 600; font-size: 14px;">Approved &amp; Verified</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CALENDAR POPUP -->
+<div class="cal" id="date-cal" hidden="">
+  <div class="ch">
+    <button type="button" id="cal-prev" aria-label="Previous month">‹</button>
+    <b id="cal-month-title">September 2026</b>
+    <button type="button" id="cal-next" aria-label="Next month">›</button>
+  </div>
+  <div class="cw">
+    <span>Su</span><span>Mo</span><span>Tu</span><span>We</span><span>Th</span><span>Fr</span><span>Sa</span>
+  </div>
+  <div class="cg" id="cal-grid"></div>
+  <div class="cf">
+    <span id="cal-hint">Select due date</span>
+    <div class="acts">
+      <button type="button" id="cal-clear">Clear</button>
+      <button type="button" id="cal-today">Today</button>
+    </div>
+  </div>
+</div>
+
+<!-- MENU POPUP -->
+<div class="menu" id="status-menu" hidden="">
+  <div class="mt" id="menu-title">Set Progress</div>
+  <div id="menu-items"></div>
+</div>
+
+<!-- TOAST -->
+<div class="toast" id="toast-msg" hidden="">
+  <span id="toast-text">Changes saved</span>
+  <button class="btn" id="toast-undo" type="button">Undo</button>
+</div>
+
+<!-- SAVEBAR -->
+<div id="savebar" hidden="">
+  <span>You have unsaved changes</span>
+  <div style="display:flex;gap:8px">
+    <button class="btn" id="btn-discard" type="button">Discard</button>
+    <button class="btn primary" id="btn-save-storage" type="button">Save Changes</button>
+  </div>
+</div>
+
+<script>
+// Default Data Setup
+const DEFAULT_DATA = {
+  title: "Hands-on training tracker",
+  desc: "Monitor progress across all engineering and robotics labs. Click any roadmap step or lab cell to update its completion status.",
+  startDate: "2026-09-28",
+  people: ["Alex", "Sam", "Jordan", "Taylor", "Morgan"],
+  labs: [
+    {
+      id: "lab1",
+      name: "Sphero Bolt Robotics & Sensors",
+      code: "ROB-101",
+      color: "var(--c0)",
+      start: "2026-09-28",
+      due: "2026-10-05",
+      team: ["Alex", "Sam", "Jordan"],
+      items: [
+        { text: "Infrared communication setup & testing", due: "2026-09-30", status: 3 },
+        { text: "Matrix LED animation & custom scripting", due: "2026-10-02", status: 2 },
+        { text: "Friction & speed calibration coursework", due: "2026-10-05", status: 0 }
+      ]
+    },
+    {
+      id: "lab2",
+      name: "Pitsco Echo Drones & Flight Control",
+      code: "DRN-202",
+      color: "var(--c1)",
+      start: "2026-10-01",
+      due: "2026-10-12",
+      team: ["Jordan", "Taylor", "Morgan"],
+      items: [
+        { text: "Pre-flight safety inspection & calibration", due: "2026-10-03", status: 1 },
+        { text: "Autonomous waypoint navigation script", due: "2026-10-08", status: 0 },
+        { text: "Obstacle avoidance sensor integration", due: "2026-10-12", status: 0 }
+      ]
+    },
+    {
+      id: "lab3",
+      name: "LEGO Education Motor Plotter API",
+      code: "AUT-303",
+      color: "var(--c2)",
+      start: "2026-10-06",
+      due: "2026-10-19",
+      team: ["Alex", "Taylor"],
+      items: [
+        { text: "Single motor angle & gear ratio calibration", due: "2026-10-10", status: 0 },
+        { text: "Pen height servo actuator mapping", due: "2026-10-15", status: 0 },
+        { text: "Vector tracing execution (Mona Lisa test)", due: "2026-10-19", status: 0 }
+      ]
+    },
+    {
+      id: "lab4",
+      name: "Computer Vision & PyTorch Pipelines",
+      code: "ML-404",
+      color: "var(--c3)",
+      start: "2026-10-12",
+      due: "2026-10-26",
+      team: ["Sam", "Morgan"],
+      items: [
+        { text: "Dataset normalization & tensor transforms", due: "2026-10-16", status: 0 },
+        { text: "Validation loop & prediction logging", due: "2026-10-21", status: 0 },
+        { text: "Confusion matrix generation & CSV mapping", due: "2026-10-26", status: 0 }
+      ]
+    }
+  ]
+};
+
+let state = JSON.parse(JSON.stringify(DEFAULT_DATA));
+let historyStack = [];
+let isDirty = false;
+let activeLabId = "lab1";
+let activeTab = "all";
+
+// DOM Elements
+const startDateIn = document.getElementById("start-date-in");
+const btnTheme = document.getElementById("btn-theme");
+const btnScreenshot = document.getElementById("btn-screenshot");
+const ganttChart = document.getElementById("gantt-chart");
+const matrixTable = document.getElementById("matrix-table");
+const labTabs = document.getElementById("lab-tabs");
+const labsContainer = document.getElementById("labs-container");
+const summaryBar = document.getElementById("summary-bar");
+const teamPanel = document.getElementById("team-panel");
+const labPeopleChips = document.getElementById("lab-people-chips");
+const btnManageTeam = document.getElementById("btn-manage-team");
+const btnExpandAll = document.getElementById("btn-expand-all");
+const savebar = document.getElementById("savebar");
+const btnSaveStorage = document.getElementById("btn-save-storage");
+const btnDiscard = document.getElementById("btn-discard");
+const toastMsg = document.getElementById("toast-msg");
+const toastText = document.getElementById("toast-text");
+const toastUndo = document.getElementById("toast-undo");
+
+// Popups
+const statusMenu = document.getElementById("status-menu");
+const menuItems = document.getElementById("menu-items");
+const menuTitle = document.getElementById("menu-title");
+const dateCal = document.getElementById("date-cal");
+const calGrid = document.getElementById("cal-grid");
+const calMonthTitle = document.getElementById("cal-month-title");
+const calPrev = document.getElementById("cal-prev");
+const calNext = document.getElementById("cal-next");
+const calClear = document.getElementById("cal-clear");
+const calToday = document.getElementById("cal-today");
+
+let activeMenu = null;
+let activeCal = null;
+let calYear = 2026, calMonth = 8; // Sept 2026
+
+// Initialize Storage if available
+async function initStorage() {
+  if (window.storage) {
+    try {
+      const saved = await window.storage.get("training_tracker_data");
+      if (saved) {
+        state = JSON.parse(saved);
+      }
+    } catch (e) {
+      console.log("No stored data found, using default.");
+    }
+  }
+  startDateIn.value = state.startDate;
+  renderAll();
+}
+
+function markDirty() {
+  isDirty = true;
+  document.body.classList.add("dirty");
+  savebar.hidden = false;
+}
+
+function saveStateToHistory() {
+  historyStack.push(JSON.stringify(state));
+  if (historyStack.length > 20) historyStack.shift();
+}
+
+function showToast(text) {
+  toastText.textContent = text;
+  toastMsg.hidden = false;
+  setTimeout(() => { toastMsg.hidden = true; }, 4000);
+}
+
+toastUndo.addEventListener("click", () => {
+  if (historyStack.length > 0) {
+    state = JSON.parse(historyStack.pop());
+    startDateIn.value = state.startDate;
+    renderAll();
+    showToast("Changes undone");
+    if (historyStack.length === 0) {
+      isDirty = false;
+      document.body.classList.remove("dirty");
+      savebar.hidden = true;
+    }
+  }
+});
+
+btnSaveStorage.addEventListener("click", async () => {
+  if (window.storage) {
+    try {
+      await window.storage.set("training_tracker_data", JSON.stringify(state));
+      showToast("Successfully saved to storage!");
+    } catch (e) {
+      showToast("Error saving to storage");
+    }
+  } else {
+    showToast("Storage API not available");
+  }
+  isDirty = false;
+  document.body.classList.remove("dirty");
+  savebar.hidden = true;
+});
+
+btnDiscard.addEventListener("click", () => {
+  initStorage();
+  isDirty = false;
+  document.body.classList.remove("dirty");
+  savebar.hidden = true;
+  showToast("Changes discarded");
+});
+
+startDateIn.addEventListener("change", (e) => {
+  saveStateToHistory();
+  state.startDate = e.target.value;
+  markDirty();
+  renderAll();
+});
+
+btnTheme.addEventListener("click", () => {
+  const root = document.documentElement;
+  const current = root.getAttribute("data-theme");
+  if (current === "dark") {
+    root.setAttribute("data-theme", "light");
+    btnTheme.textContent = "Dark Mode";
+  } else {
+    root.setAttribute("data-theme", "dark");
+    btnTheme.textContent = "Light Mode";
+  }
+});
+
+btnScreenshot.addEventListener("click", () => {
+  if (window.parent && window.parent !== window) {
+    // handled by bridge
+    showToast("Screenshot capture triggered");
+  } else {
+    showToast("Screenshot ready");
+  }
+});
+
+// Helpers for dates and progress
+function parseDate(str) {
+  const parts = str.split("-");
+  return new Date(parts[0], parts[1] - 1, parts[2]);
+}
+
+function formatDate(d) {
+  return d.toISOString().split("T")[0];
+}
+
+function getDayDiff(d1, d2) {
+  const t1 = parseDate(d1).getTime();
+  const t2 = parseDate(d2).getTime();
+  return Math.round((t2 - t1) / (1000 * 3600 * 24));
+}
+
+function getLabProgress(lab) {
+  if (!lab.items || lab.items.length === 0) return 0;
+  const sum = lab.items.reduce((acc, it) => acc + (it.status || 0), 0);
+  return Math.round((sum / (lab.items.length * 3)) * 100);
+}
+
+function getOverallStats() {
+  let totalItems = 0;
+  let completedItems = 0;
+  let overdueCount = 0;
+  const todayStr = formatDate(new Date());
+
+  state.labs.forEach(lab => {
+    lab.items.forEach(it => {
+      totalItems++;
+      if (it.status === 3) completedItems++;
+      if (it.status < 3 && it.due && it.due < todayStr) {
+        overdueCount++;
+      }
+    });
+  });
+  return { totalItems, completedItems, overdueCount };
+}
+
+// Render Everything
+function renderAll() {
+  renderSummary();
+  renderGantt();
+  renderMatrix();
+  renderLabs();
+}
+
+function renderSummary() {
+  const stats = getOverallStats();
+  summaryBar.innerHTML = `
+    <div><b>${state.labs.length}</b>Labs Tracked</div>
+    <div><b>${stats.totalItems}</b>Total Items</div>
+    <div><b>${stats.completedItems}</b>Completed</div>
+    <div class="late"><b>${stats.overdueCount}</b>Overdue</div>
+  `;
+}
+
+// Gantt / Roadmap render
+function renderGantt() {
+  const startD = parseDate(state.startDate);
+  // find min start and max due
+  let minTime = startD.getTime();
+  let maxTime = minTime + 35 * 24 * 3600 * 1000;
+
+  state.labs.forEach(l => {
+    const st = parseDate(l.start).getTime();
+    const du = parseDate(l.due).getTime();
+    if (st < minTime) minTime = st;
+    if (du > maxTime) maxTime = du;
+  });
+
+  const totalDays = Math.max(28, Math.ceil((maxTime - minTime) / (1000 * 3600 * 24)));
+  const minDateStr = formatDate(new Date(minTime));
+
+  let html = `
+    <div class="axis">
+      <div></div>
+      <div class="axis-lane">
+        <span style="left:0%">${minDateStr}</span>
+        <span style="left:50%">Day ${Math.floor(totalDays/2)}</span>
+        <span style="left:100%;transform:translateX(-100%)">Day ${totalDays}</span>
+      </div>
+    </div>
+    <div class="grows">
+      <div class="lines">
+  `;
+
+  // grid lines
+  for (let i = 0; i <= 4; i++) {
+    const pct = (i / 4) * 100;
+    html += `<i style="left:${pct}%"></i>`;
+  }
+
+  // today line
+  const todayStr = formatDate(new Date());
+  const todayDiff = getDayDiff(minDateStr, todayStr);
+  if (todayDiff >= 0 && todayDiff <= totalDays) {
+    const todayPct = (todayDiff / totalDays) * 100;
+    html += `<div class="today" style="left:${todayPct}%"><span>Today</span></div>`;
+  }
+
+  html += `</div>`;
+
+  state.labs.forEach(l => {
+    const lStart = getDayDiff(minDateStr, l.start);
+    const lDuration = Math.max(3, getDayDiff(l.start, l.due));
+    const leftPct = Math.max(0, Math.min(100, (lStart / totalDays) * 100));
+    const widthPct = Math.max(4, Math.min(100 - leftPct, (lDuration / totalDays) * 100));
+    const prog = getLabProgress(l);
+
+    html += `
+      <button class="grow" type="button" onclick="focusLab('${l.id}')">
+        <div class="gtxt">
+          <div class="gl">
+            <span class="gn" style="--c:${l.color}">${l.name}</span>
+            <span class="gp" style="--c:${l.color}">${prog}%</span>
+          </div>
+          <span class="gm">${l.code} &bull; Due ${l.due}</span>
+        </div>
+        <div class="lane">
+          <div class="lbar" style="--l:${leftPct}%;--w:${widthPct}%;--c:${l.color}">
+            <i style="--p:${prog}%"></i>
+          </div>
+        </div>
+      </button>
+    `;
+  });
+
+  html += `</div><div class="cap">Roadmap schedule dynamically computed from lab start and due dates.</div>`;
+  ganttChart.innerHTML = html;
+}
+
+function focusLab(id) {
+  activeLabId = id;
+  renderLabs();
+  const el = document.getElementById("lab-sec-" + id);
+  if (el) el.scrollIntoView({ behavior: "smooth" });
+}
+
+// Team Progress Matrix render
+function renderMatrix() {
+  const np = state.people.length;
+  let html = `
+    <thead>
+      <tr class="row hd">
+        <th>Lab / Module</th>
+        ${state.people.map(p => `<th><span class="dot" style="background:var(--c0)"></span>${p}</th>`).join("")}
+        <th><button class="hbtn" type="button" onclick="openAddPersonModal()">+ Add Person</button></th>
+      </tr>
+    </thead>
+    <tbody>
+  `;
+
+  state.labs.forEach(l => {
+    html += `
+      <tr>
+        <td class="who"><span style="color:${l.color}">&#9632;</span> ${l.name}</td>
+    `;
+    state.people.forEach(p => {
+      // compute person progress in this lab
+      // For demo, check if person is in team, or compute average status of items
+      const isAssigned = l.team.includes(p);
+      const prog = isAssigned ? getLabProgress(l) : 0;
+      const cellClass = prog === 100 ? "cell all" : "cell";
+      const width = prog;
+      html += `
+        <td>
+          <button class="${cellClass}" type="button" style="--c:${l.color}" onclick="openMatrixPopup('${l.id}','${p}',event)">
+            <b>${prog}%</b>
+          </button>
+        </td>
+      `;
+    });
+    html += `<td></td></tr>`;
+  });
+
+  html += `</tbody>`;
+  matrixTable.style.setProperty("--np", np);
+  matrixTable.innerHTML = html;
+}
+
+// Labs & Checklists render
+function renderLabs() {
+  // Tabs
+  let tabsHtml = `<button class="tab" aria-pressed="${activeTab==='all'}" type="button" onclick="setTab('all')">All Labs</button>`;
+  state.labs.forEach(l => {
+    tabsHtml += `<button class="tab" aria-pressed="${activeTab===l.id}" type="button" onclick="setTab('${l.id}')">${l.name}</button>`;
+  });
+  labTabs.innerHTML = tabsHtml;
+
+  // Render team panel chips for active lab
+  const activeLabObj = state.labs.find(l => l.id === activeLabId) || state.labs[0];
+  let chipsHtml = "";
+  state.people.forEach(p => {
+    const assigned = activeLabObj.team.includes(p);
+    chipsHtml += `
+      <label class="person">
+        <input type="checkbox" ${assigned ? "checked" : ""} onchange="toggleTeamMember('${activeLabObj.id}','${p}')">
+        <span>${p}</span>
+      </label>
+    `;
+  });
+  labPeopleChips.innerHTML = chipsHtml;
+
+  // Render labs list
+  let html = "";
+  const filteredLabs = activeTab === 'all' ? state.labs : state.labs.filter(l => l.id === activeTab);
+
+  filteredLabs.forEach(l => {
+    const prog = getLabProgress(l);
+    html += `
+      <div class="lab" id="lab-sec-${l.id}" style="--c:${l.color}">
+        <div class="lab-head">
+          <div>
+            <h3>${l.name}</h3>
+            <div class="meta">${l.code} &bull; Start: 
+              <button class="hbtn" type="button" onclick="openDatePick(event,'lab','${l.id}','start','${l.start}')">${l.start}</button> 
+              &bull; Due: 
+              <button class="hbtn" type="button" onclick="openDatePick(event,'lab','${l.id}','due','${l.due}')">${l.due}</button>
+            </div>
+          </div>
+          <div class="lh-tools">
+            <div class="stepper">
+              <span>Progress: <b>${prog}%</b></span>
+            </div>
+            <button class="mini danger" type="button" onclick="deleteLab('${l.id}')">Delete Lab</button>
+          </div>
+        </div>
+
+        <div class="row hd">
+          <div>Training Item / Task</div>
+          <div>Due Date</div>
+          <div>Status</div>
+          <div></div>
+        </div>
+    `;
+
+    l.items.forEach((item, idx) => {
+      const todayStr = formatDate(new Date());
+      const isLate = item.status < 3 && item.due && item.due < todayStr;
+      const statusLabels = ["Not Started", "In Progress (1/3)", "In Progress (2/3)", "Completed"];
+      const pillClass = item.status === 3 ? "pill s3" : (item.status > 0 ? "pill s2" : "pill s1");
+      
+      html += `
+        <div class="row">
+          <div class="item">
+            <input class="in sm" type="text" value="${item.text}" onchange="updateItemText('${l.id}',${idx},this.value)">
+          </div>
+          <div class="due ${isLate ? 'late' : ''}">
+            <button class="hbtn ${isLate ? 'late' : ''}" type="button" onclick="openDatePick(event,'item','${l.id}',${idx},'${item.due}')">${item.due || 'Set due'}</button>
+          </div>
+          <div class="tools">
+            <button class="${pillClass}" type="button" style="--c:${l.color}" onclick="openStatusMenu(event,'${l.id}',${idx})">
+              <span>${statusLabels[item.status]}</span>
+              <span class="pn">${item.status}/3</span>
+            </button>
+          </div>
+          <div>
+            <button class="mini danger" type="button" onclick="deleteItem('${l.id}',${idx})">Remove</button>
+          </div>
+        </div>
+      `;
+    });
+
+    html += `
+        <div class="addrow" style="margin-top:12px">
+          <button class="btn" type="button" onclick="addItem('${l.id}')">+ Add Task</button>
+        </div>
+      </div>
+    `;
+  });
+
+  html += `<div style="margin-top:20px"><button class="btn primary" type="button" onclick="addLab()">+ Add New Lab</button></div>`;
+  labsContainer.innerHTML = html;
+}
+
+function setTab(tabId) {
+  activeTab = tabId;
+  renderLabs();
+}
+
+// Interactive Actions & State Modifiers
+function toggleTeamMember(labId, person) {
+  saveStateToHistory();
+  const lab = state.labs.find(l => l.id === labId);
+  if (lab) {
+    if (lab.team.includes(person)) {
+      lab.team = lab.team.filter(p => p !== person);
+    } else {
+      lab.team.push(person);
+    }
+  }
+  markDirty();
+  renderMatrix();
+  renderLabs();
+}
+
+function updateItemText(labId, idx, val) {
+  saveStateToHistory();
+  const lab = state.labs.find(l => l.id === labId);
+  if (lab && lab.items[idx]) {
+    lab.items[idx].text = val;
+  }
+  markDirty();
+}
+
+function deleteItem(labId, idx) {
+  saveStateToHistory();
+  const lab = state.labs.find(l => l.id === labId);
+  if (lab) {
+    lab.items.splice(idx, 1);
+  }
+  markDirty();
+  renderAll();
+  showToast("Task removed");
+}
+
+function addItem(labId) {
+  saveStateToHistory();
+  const lab = state.labs.find(l => l.id === labId);
+  if (lab) {
+    lab.items.push({ text: "New training milestone", due: lab.due, status: 0 });
+  }
+  markDirty();
+  renderAll();
+}
+
+function addLab() {
+  saveStateToHistory();
+  const newId = "lab" + (state.labs.length + 1);
+  const colors = ["var(--c4)", "var(--c5)", "var(--c6)", "var(--c7)", "var(--c0)"];
+  const color = colors[state.labs.length % colors.length];
+  state.labs.push({
+    id: newId,
+    name: "New Engineering Lab",
+    code: "ENG-900",
+    color: color,
+    start: formatDate(new Date()),
+    due: formatDate(new Date(Date.now() + 14*24*3600*1000)),
+    team: [state.people[0]],
+    items: [
+      { text: "Initial hardware setup & wiring", due: formatDate(new Date()), status: 0 }
+    ]
+  });
+  activeLabId = newId;
+  markDirty();
+  renderAll();
+  showToast("New lab added");
+}
+
+function deleteLab(labId) {
+  if (state.labs.length <= 1) {
+    showToast("Cannot delete the last lab");
+    return;
+  }
+  saveStateToHistory();
+  state.labs = state.labs.filter(l => l.id !== labId);
+  activeLabId = state.labs[0].id;
+  markDirty();
+  renderAll();
+  showToast("Lab removed");
+}
+
+function openAddPersonModal() {
+  const name = prompt("Enter new team member name:");
+  if (name && name.trim() !== "") {
+    saveStateToHistory();
+    state.people.push(name.trim());
+    markDirty();
+    renderAll();
+    showToast("Team member added");
+  }
+}
+
+// Status Menu Popup
+function openStatusMenu(e, labId, itemIdx) {
+  e.stopPropagation();
+  activeMenu = { labId, itemIdx };
+  const lab = state.labs.find(l => l.id === labId);
+  const item = lab.items[itemIdx];
+
+  menuTitle.textContent = "Set Status";
+  const statuses = [
+    { val: 0, label: "Not Started", desc: "0% complete" },
+    { val: 1, label: "In Progress (1/3)", desc: "Started / Basic setup" },
+    { val: 2, label: "In Progress (2/3)", desc: "Nearly complete / Testing" },
+    { val: 3, label: "Completed", desc: "Fully verified & signed off" }
+  ];
+
+  let html = "";
+  statuses.forEach(s => {
+    const checked = item.status === s.val;
+    const sdClass = s.val === 3 ? "sd s3" : (s.val === 2 ? "sd s2" : (s.val === 1 ? "sd s1" : "sd s0"));
+    html += `
+      <button type="button" role="menuitem" aria-checked="${checked}" onclick="selectStatus(${s.val})">
+        <span class="${sdClass}" style="--c:${lab.color}"></span>
+        <div>
+          <div style="font-weight:600">${s.label}</div>
+          <div style="font-size:12px;color:var(--mute)">${s.desc}</div>
+        </div>
+      </button>
+    `;
+  });
+
+  menuItems.innerHTML = html;
+  const rect = e.currentTarget.getBoundingClientRect();
+  statusMenu.style.top = (rect.bottom + 6) + "px";
+  statusMenu.style.left = Math.min(window.innerWidth - 220, rect.left) + "px";
+  statusMenu.hidden = false;
+}
+
+function selectStatus(val) {
+  if (!activeMenu) return;
+  saveStateToHistory();
+  const lab = state.labs.find(l => l.id === activeMenu.labId);
+  if (lab && lab.items[activeMenu.itemIdx]) {
+    lab.items[activeMenu.itemIdx].status = val;
+  }
+  statusMenu.hidden = true;
+  markDirty();
+  renderAll();
+  showToast("Status updated");
+}
+
+// Matrix Cell Click Popup
+function openMatrixPopup(labId, person, e) {
+  e.stopPropagation();
+  activeMenu = { labId, person };
+  const lab = state.labs.find(l => l.id === labId);
+  const isAssigned = lab.team.includes(person);
+
+  menuTitle.textContent = `${person} (${lab.name})`;
+  let html = `
+    <button type="button" onclick="toggleMatrixAssign('${labId}','${person}')">
+      <div>
+        <div style="font-weight:600">${isAssigned ? "Remove from Lab Team" : "Assign to Lab Team"}</div>
+        <div style="font-size:12px;color:var(--mute)">Toggle participation</div>
+      </div>
+    </button>
+  `;
+  menuItems.innerHTML = html;
+  const rect = e.currentTarget.getBoundingClientRect();
+  statusMenu.style.top = (rect.bottom + 6) + "px";
+  statusMenu.style.left = Math.min(window.innerWidth - 220, rect.left) + "px";
+  statusMenu.hidden = false;
+}
+
+function toggleMatrixAssign(labId, person) {
+  toggleTeamMember(labId, person);
+  statusMenu.hidden = true;
+}
+
+// Calendar Popup
+function openDatePick(e, type, labId, targetKey, curDateVal) {
+  e.stopPropagation();
+  activeCal = { type, labId, targetKey };
+  const d = curDateVal ? parseDate(curDateVal) : new Date();
+  calYear = d.getFullYear();
+  calMonth = d.getMonth();
+  renderCalGrid(curDateVal);
+
+  const rect = e.currentTarget.getBoundingClientRect();
+  dateCal.style.top = (rect.bottom + 6) + "px";
+  dateCal.style.left = Math.min(window.innerWidth - 320, rect.left) + "px";
+  dateCal.hidden = false;
+}
+
+function renderCalGrid(selectedDateStr) {
+  const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+  calMonthTitle.textContent = `${months[calMonth]} ${calYear}`;
+
+  const firstDay = new Date(calYear, calMonth, 1).getDay();
+  const daysInMonth = new Date(calYear, calMonth + 1, 0).getDate();
+  const todayStr = formatDate(new Date());
+
+  let html = "";
+  for (let i = 0; i < firstDay; i++) {
+    html += `<span></span>`;
+  }
+
+  for (let d = 1; d <= daysInMonth; d++) {
+    const mStr = String(calMonth + 1).padStart(2, "0");
+    const dStr = String(d).padStart(2, "0");
+    const fullDate = `${calYear}-${mStr}-${dStr}`;
+
+    const isToday = fullDate === todayStr;
+    const isSelected = fullDate === selectedDateStr;
+    const cls = `cg button ${isToday ? 'td' : ''} ${isSelected ? 'ed' : ''}`;
+
+    html += `<button type="button" class="${isToday ? 'td' : ''} ${isSelected ? 'ed' : ''}" onclick="selectCalDate('${fullDate}')">${d}</button>`;
+  }
+
+  calGrid.innerHTML = html;
+}
+
+calPrev.addEventListener("click", () => {
+  calMonth--;
+  if (calMonth < 0) { calMonth = 11; calYear--; }
+  renderCalGrid("");
+});
+
+calNext.addEventListener("click", () => {
+  calMonth++;
+  if (calMonth > 11) { calMonth = 0; calYear++; }
+  renderCalGrid("");
+});
+
+calClear.addEventListener("click", () => {
+  if (!activeCal) return;
+  saveStateToHistory();
+  const lab = state.labs.find(l => l.id === activeCal.labId);
+  if (lab) {
+    if (activeCal.type === 'lab') lab[activeCal.targetKey] = "";
+    else if (activeCal.type === 'item') lab.items[activeCal.targetKey].due = "";
+  }
+  dateCal.hidden = true;
+  markDirty();
+  renderAll();
+  showToast("Date cleared");
+});
+
+calToday.addEventListener("click", () => {
+  selectCalDate(formatDate(new Date()));
+});
+
+function selectCalDate(dateStr) {
+  if (!activeCal) return;
+  saveStateToHistory();
+  const lab = state.labs.find(l => l.id === activeCal.labId);
+  if (lab) {
+    if (activeCal.type === 'lab') lab[activeCal.targetKey] = dateStr;
+    else if (activeCal.type === 'item') lab.items[activeCal.targetKey].due = dateStr;
+  }
+  dateCal.hidden = true;
+  markDirty();
+  renderAll();
+  showToast("Date updated");
+}
+
+// Global click handlers to close popups
+window.addEventListener("click", (e) => {
+  if (!statusMenu.contains(e.target)) statusMenu.hidden = true;
+  if (!dateCal.contains(e.target)) dateCal.hidden = true;
+});
+
+btnExpandAll.addEventListener("click", () => {
+  activeTab = 'all';
+  renderLabs();
+  showToast("Showing all labs");
+});
+
+// Run Init
+initStorage();
+</script>
+
+
+</body></html>
